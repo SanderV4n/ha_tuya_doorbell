@@ -123,7 +123,11 @@
           "host": "IP address",
           "port": "Port",
           "protocol_version": "Protocol version",
+          "low_power_mode": "Low power / battery mode (sleeps when idle, passive connect)",
           "back": "Back to the options menu (nothing on this screen is saved)"
+        },
+        "data_description": {
+          "low_power_mode": "Enable for battery-powered doorbells. When enabled, Home Assistant connects passively upon wake-up broadcasts and avoids querying datapoints that cause sleep-mode devices to disconnect."
         }
       },
       "dp_list": {

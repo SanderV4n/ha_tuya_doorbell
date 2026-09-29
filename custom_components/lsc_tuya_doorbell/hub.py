@@ -79,6 +79,7 @@ from .const import (
     DP_TYPE_RAW,
     DP_TYPE_STRING,
     CONF_DEBUG_EVENTS,
+    CONF_LOW_POWER_MODE,
     DEFAULT_DEBUG_EVENTS,
     EVENT_BUTTON_PRESS,
     EVENT_CONNECTED,
@@ -111,7 +112,7 @@ from .const import (
     WWW_DIRECTORY,
     mask_credential,
 )
-from .discovery.manager import DiscoveryManager
+from .discovery import DiscoveredDevice, DiscoveryManager
 from .dp_discovery import DPDiscoveryEngine, DiscoveredDP, LiveCapture
 from .dp_registry import DPDefinition, DPRegistry, DeviceProfile
 from .protocol.connection import TuyaConnection
@@ -539,6 +540,8 @@ class DeviceHub:
         self._onvif_recovery_handle: Callable[[], None] | None = None
         self._unregister_disconnect: Callable | None = None
         self._unregister_status: Callable | None = None
+        self._unregister_discovery: Callable[[], None] | None = None
+        self._wake_event = asyncio.Event()
 
         # Set just before the hub rewrites its own config entry after an IP
         # change, so the update listener does not reload the entry and cancel
@@ -562,6 +565,35 @@ class DeviceHub:
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def is_battery_powered(self) -> bool:
+        """Return True if this device is battery-operated / sleep-mode device.
+
+        Auto-detected by checking whether battery percentage (DP 145) is present in
+        the profile or received state, or explicitly configured via CONF_LOW_POWER_MODE.
+        """
+        if self._profile and 145 in self._profile.discovered_dps:
+            return True
+        if "145" in self._dps_state:
+            return True
+        return bool(self._option(CONF_LOW_POWER_MODE, False))
+
+    def _on_device_discovered(self, device: DiscoveredDevice) -> None:
+        """Handle UDP broadcast notification from this device."""
+        _LOGGER.debug(
+            "Device %s announced via UDP broadcast at %s", device.device_id, device.ip
+        )
+        if device.ip and device.ip != self._host:
+            _LOGGER.info(
+                "Device %s updated IP via broadcast: %s -> %s",
+                self._device_id,
+                self._host,
+                device.ip,
+            )
+            self._host = device.ip
+            self._connection.host = device.ip
+        self._wake_event.set()
 
     @property
     def entry_id(self) -> str:
@@ -999,6 +1031,9 @@ class DeviceHub:
         await self._snapshots.async_start()
         _LOGGER.debug("Snapshot provider: %s", self._snapshots.status)
 
+        self._unregister_discovery = self._discovery_manager.register_device_listener(
+            self._device_id, self._on_device_discovered
+        )
         self._unregister_status = self._connection.on_status_update(
             self._handle_status_update
         )
@@ -1017,18 +1052,23 @@ class DeviceHub:
             self._heartbeat_task = self._spawn(self._heartbeat_loop(), "heartbeat")
             _LOGGER.debug("Heartbeat loop started")
 
-            try:
-                _LOGGER.debug("Querying initial DP state")
-                dps = await self._connection.query_dps()
-                if dps:
-                    _LOGGER.debug("Initial DPS: %s", dps)
-                    self._handle_status_update(dps)
-                else:
-                    _LOGGER.debug("Initial DP query returned empty")
-            except Exception:  # noqa: BLE001 - the heartbeat will pick state up later
-                _LOGGER.warning(
-                    "Initial datapoint query failed for %s; entities stay unknown "
-                    "until the device reports by itself", self._device_id, exc_info=True,
+            if not self.is_battery_powered:
+                try:
+                    _LOGGER.debug("Querying initial DP state")
+                    dps = await self._connection.query_dps()
+                    if dps:
+                        _LOGGER.debug("Initial DPS: %s", dps)
+                        self._handle_status_update(dps)
+                    else:
+                        _LOGGER.debug("Initial DP query returned empty")
+                except Exception:  # noqa: BLE001 - the heartbeat will pick state up later
+                    _LOGGER.warning(
+                        "Initial datapoint query failed for %s; entities stay unknown "
+                        "until the device reports by itself", self._device_id, exc_info=True,
+                    )
+            else:
+                _LOGGER.debug(
+                    "Battery-powered device: skipping initial DP query to allow passive push"
                 )
 
             return True
@@ -1076,6 +1116,9 @@ class DeviceHub:
 
         await self._snapshots.async_stop()
 
+        if self._unregister_discovery:
+            self._unregister_discovery()
+            self._unregister_discovery = None
         if self._unregister_status:
             self._unregister_status()
             self._unregister_status = None
@@ -1846,7 +1889,14 @@ class DeviceHub:
         self._available = False
         self._fire_event(EVENT_DISCONNECTED)
         self._notify_connection_callbacks(False)
-        _LOGGER.warning("Connection lost to %s (%s)", self._device_name, self._host)
+        if self.is_battery_powered:
+            _LOGGER.debug(
+                "Battery device %s entered sleep mode (%s)",
+                self._device_name,
+                self._host,
+            )
+        else:
+            _LOGGER.warning("Connection lost to %s (%s)", self._device_name, self._host)
 
         if not self._reconnect_task or self._reconnect_task.done():
             self._reconnect_task = self._spawn(self._reconnect(), "reconnect")
@@ -1888,17 +1938,29 @@ class DeviceHub:
     async def _reconnect(self) -> None:
         """Reconnect sequence with discovery fallback."""
         try:
-            await asyncio.sleep(RECONNECT_INITIAL_WAIT)
+            self._wake_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._wake_event.wait(), timeout=RECONNECT_INITIAL_WAIT
+                )
+            except asyncio.TimeoutError:
+                pass
 
             backoff_index = 0
 
             while True:
                 # Step 1: Try known IP
                 for attempt in range(RECONNECT_RETRY_COUNT):
-                    _LOGGER.info(
-                        "Reconnect attempt %s/%s to %s:%s",
-                        attempt + 1, RECONNECT_RETRY_COUNT, self._host, self._port,
-                    )
+                    if self.is_battery_powered:
+                        _LOGGER.debug(
+                            "Reconnect attempt %s/%s to %s:%s",
+                            attempt + 1, RECONNECT_RETRY_COUNT, self._host, self._port,
+                        )
+                    else:
+                        _LOGGER.info(
+                            "Reconnect attempt %s/%s to %s:%s",
+                            attempt + 1, RECONNECT_RETRY_COUNT, self._host, self._port,
+                        )
                     try:
                         await self._connection.disconnect()
                         self._connection.host = self._host
@@ -1906,15 +1968,20 @@ class DeviceHub:
                         self._after_reconnect()
                         _LOGGER.info("Reconnected to %s at %s", self._device_id, self._host)
 
-                        try:
-                            dps = await self._connection.query_dps()
-                            if dps:
-                                self._handle_status_update(dps)
-                        except Exception:  # noqa: BLE001 - state follows on the next push
-                            _LOGGER.warning(
-                                "Could not refresh datapoints after reconnecting "
-                                "to %s; entities keep their last value until the "
-                                "device reports", self._device_id, exc_info=True,
+                        if not self.is_battery_powered:
+                            try:
+                                dps = await self._connection.query_dps()
+                                if dps:
+                                    self._handle_status_update(dps)
+                            except Exception:  # noqa: BLE001 - state follows on the next push
+                                _LOGGER.warning(
+                                    "Could not refresh datapoints after reconnecting "
+                                    "to %s; entities keep their last value until the "
+                                    "device reports", self._device_id, exc_info=True,
+                                )
+                        else:
+                            _LOGGER.debug(
+                                "Battery device reconnected; listening passively for pushes"
                             )
                         return
 
@@ -1924,9 +1991,15 @@ class DeviceHub:
 
                 # Step 2: Try discovery
                 _LOGGER.info("Trying discovery for %s", self._device_id)
-                new_ip = await self._discovery_manager.full_scan(
-                    self._device_id, self._local_key, self._version
-                )
+                new_ip = None
+                try:
+                    new_ip = await self._discovery_manager.full_scan(
+                        self._device_id, self._local_key, self._version
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "Discovery scan failed for %s", self._device_id, exc_info=True
+                    )
 
                 if new_ip and new_ip != self._host:
                     _LOGGER.info(
@@ -1957,11 +2030,27 @@ class DeviceHub:
                     if connected:
                         return
 
-                # Exponential backoff
+                # Exponential backoff (can be interrupted immediately by UDP wake-up broadcast)
                 delay = RECONNECT_BACKOFF[min(backoff_index, len(RECONNECT_BACKOFF) - 1)]
-                _LOGGER.info("Reconnect backoff: waiting %ss", delay)
-                await asyncio.sleep(delay)
-                backoff_index += 1
+                if self.is_battery_powered:
+                    _LOGGER.debug(
+                        "Waiting for battery device %s to wake up (max %ss)",
+                        self._device_id,
+                        delay,
+                    )
+                else:
+                    _LOGGER.info("Reconnect backoff: waiting %ss", delay)
+
+                self._wake_event.clear()
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=delay)
+                    _LOGGER.info(
+                        "Device %s woke up via broadcast; reconnecting immediately",
+                        self._device_id,
+                    )
+                    backoff_index = 0
+                except asyncio.TimeoutError:
+                    backoff_index += 1
 
         except asyncio.CancelledError:
             return

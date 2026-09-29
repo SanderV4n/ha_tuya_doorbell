@@ -211,14 +211,15 @@ class TuyaConnection:
         was_connected = self._connected
         self._connected = False
 
-        if self._read_task is asyncio.current_task():
+        read_task = getattr(self, "_read_task", None)
+        if read_task is asyncio.current_task():
             # Called from inside the read loop's own callback chain; cancelling
             # ourselves here would deadlock on the await below.
             self._read_task = None
-        elif self._read_task and not self._read_task.done():
-            self._read_task.cancel()
+        elif read_task and not read_task.done():
+            read_task.cancel()
             try:
-                await self._read_task
+                await read_task
             except asyncio.CancelledError:
                 # Our own cancellation, not an outer one: the task is gone.
                 pass
@@ -724,8 +725,7 @@ class TuyaConnection:
             len(self._pending_requests),
         )
 
-        if self._resolve_pending(msg):
-            return
+        resolved = self._resolve_pending(msg)
 
         if msg.command in (
             Command.STATUS, Command.CONTROL, Command.CONTROL_NEW,
@@ -746,7 +746,10 @@ class TuyaConnection:
             else:
                 _LOGGER.debug("Dispatch: push cmd=%d with empty DPS (ack)", msg.command)
 
-        elif msg.command == Command.HEARTBEAT:
+        if resolved:
+            return
+
+        if msg.command == Command.HEARTBEAT:
             _LOGGER.debug("Dispatch: device-initiated heartbeat response")
         else:
             _LOGGER.debug("Dispatch: unhandled cmd=%d (no pending, not a push)", msg.command)

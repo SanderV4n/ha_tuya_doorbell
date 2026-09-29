@@ -37,6 +37,7 @@ from .const import (
     LEGACY_FORCE_RECORD_OPTION,
     CONF_HOST,
     CONF_LOCAL_KEY,
+    CONF_LOW_POWER_MODE,
     CONF_ONVIF_PASSWORD,
     CONF_ONVIF_USERNAME,
     CONF_PORT,
@@ -1111,7 +1112,7 @@ class LscTuyaDoorbellOptionsFlow(OptionsFlow):
 
         if user_input is not None:
             new_data = dict(self._config_entry.data)
-            for key in (CONF_HOST, CONF_PORT, CONF_PROTOCOL_VERSION):
+            for key in (CONF_HOST, CONF_PORT, CONF_PROTOCOL_VERSION, CONF_LOW_POWER_MODE):
                 if key in user_input:
                     new_data[key] = user_input[key]
 
@@ -1121,6 +1122,12 @@ class LscTuyaDoorbellOptionsFlow(OptionsFlow):
             return await self.async_step_init()
 
         current = self._config_entry.data
+        hub = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
+        default_low_power = current.get(
+            CONF_LOW_POWER_MODE,
+            hub.is_battery_powered if hub is not None else False,
+        )
+
         return self.async_show_form(
             step_id="connection",
             data_schema=vol.Schema(
@@ -1138,6 +1145,10 @@ class LscTuyaDoorbellOptionsFlow(OptionsFlow):
                                 CONF_PROTOCOL_VERSION, DEFAULT_PROTOCOL_VERSION
                             ),
                         ): vol.In(list(SUPPORTED_PROTOCOL_VERSIONS)),
+                        vol.Optional(
+                            CONF_LOW_POWER_MODE,
+                            default=default_low_power,
+                        ): bool,
                     }
                 )
             ),

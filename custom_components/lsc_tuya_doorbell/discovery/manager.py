@@ -53,6 +53,22 @@ class DiscoveryManager:
         self._background_task: asyncio.Task | None = None
         self._running = False
         self._unsubscribe: Callable[[], None] | None = None
+        self._device_listeners: dict[str, list[Callable[[DiscoveredDevice], None]]] = {}
+
+    def register_device_listener(
+        self, device_id: str, callback: Callable[[DiscoveredDevice], None]
+    ) -> Callable[[], None]:
+        """Register a callback for UDP broadcasts from a specific device."""
+        self._device_listeners.setdefault(device_id, []).append(callback)
+
+        def _unregister() -> None:
+            callbacks = self._device_listeners.get(device_id, [])
+            if callback in callbacks:
+                callbacks.remove(callback)
+            if not callbacks:
+                self._device_listeners.pop(device_id, None)
+
+        return _unregister
 
     @property
     def cache(self) -> dict[str, DiscoveredDevice]:
@@ -90,6 +106,7 @@ class DiscoveryManager:
             self._unsubscribe = None
         await self._udp_listener.stop()
         self._cache.clear()
+        self._device_listeners.clear()
         _LOGGER.debug("Discovery manager stopped")
 
     async def async_discover(self, timeout: float = 10.0) -> list[DiscoveredDevice]:
@@ -247,6 +264,13 @@ class DiscoveryManager:
     def _remember(self, device: DiscoveredDevice) -> None:
         """Store a freshly heard device in the shared cache."""
         self._cache[device.device_id] = device
+        for callback in list(self._device_listeners.get(device.device_id, [])):
+            try:
+                callback(device)
+            except Exception:
+                _LOGGER.exception(
+                    "Error in discovery listener callback for %s", device.device_id
+                )
 
     def _evict_expired(self) -> None:
         """Remove expired entries from cache."""
